@@ -44,6 +44,202 @@ def feature_importance_xgb(lst: list):
         ax.tick_params(axis='x', rotation=0, labelsize=12)
 
 
+class QuantileClipper(BaseEstimator, TransformerMixin):
+        def __init__(self, lower=0.01, upper=0.99):
+            self.lower = lower
+            self.upper = upper
+            
+        def fit(self, X, y=None):
+            self.lower_bounds_ = np.quantile(X, self.lower, axis=0)
+            self.upper_bounds_ = np.quantile(X, self.upper, axis=0)
+            return self
+        
+        def transform(self, X):
+            return np.clip(X, self.lower_bounds_, self.upper_bounds_)
+
+        def get_feature_names_out(self, input_features=None):
+            return input_features
+
+def run_regression_pipeline(
+    df,
+    *,
+    target_col='price',
+    seed=42,
+    test_size=0.2,
+    # columns configuration (None -> auto detect)
+    num_cols=None,
+    cat_cols=None,
+    onehot_cols=None,
+    count_cols=None,
+    target_cols=None,
+    clip_cols=None,
+    clip_quantiles=(0.01, 0.99),
+    drop_cols=None,
+    # models / cv / scoring
+    models=None,
+    scoring=None,
+    n_splits=5,
+    n_jobs=-1,
+    return_splits=False,
+    return_preprocessor=False
+):
+    """
+    Универсальная регрессионная функция.
+    Возвращает: result_cross_val, result_test, list_of_models
+    Опции:
+      - count_cols: список колонок для CountEncoder
+      - target_cols: список колонок для TargetEncoder
+      - clip_cols: список числовых колонок для QuantileClipper
+      - onehot_cols: какие категориальные кодировать через OneHot (по умолчанию все, кроме тех, что в count/target)
+    Параметры return_splits и return_preprocessor добавляют к возвращаемому кортежу соответствующие объекты.
+    """
+
+    if target_col not in df.columns:
+        raise ValueError(f"Входной df должен содержать колонку '{target_col}'")
+
+    # 1. X, y
+    X = df.drop(columns=[target_col]).copy()
+    if drop_cols:
+        X = X.drop(columns=drop_cols, errors='ignore')
+    y = df[target_col].copy()
+
+    # 2. Автовыбор колонок
+    num_cols_all = X.select_dtypes(include='number').columns.to_list()
+    cat_cols_all = X.select_dtypes(exclude='number').columns.to_list()
+
+    if num_cols is None:
+        num_cols = num_cols_all.copy()
+    else:
+        num_cols = [c for c in num_cols if c in X.columns]
+
+    if cat_cols is None:
+        cat_cols = cat_cols_all.copy()
+    else:
+        cat_cols = [c for c in cat_cols if c in X.columns]
+
+    if onehot_cols is None:
+        onehot_cols = cat_cols.copy()
+    else:
+        onehot_cols = [c for c in onehot_cols if c in cat_cols]
+
+    count_cols = [c for c in (count_cols or []) if c in X.columns]
+    target_cols = [c for c in (target_cols or []) if c in X.columns]
+    clip_cols = [c for c in (clip_cols or []) if c in X.columns]
+
+
+    # If clipped numeric columns are handled separately, remove from generic numeric list
+    num_cols_for_standard = [c for c in num_cols if c not in clip_cols]
+
+    # 3. Build transformers list for ColumnTransformer
+    transformers = []
+
+    if len(num_cols_for_standard) > 0:
+        num_pipeline = Pipeline([('scaler', StandardScaler())])
+        transformers.append(('num', num_pipeline, num_cols_for_standard))
+
+    if len(clip_cols) > 0:
+        clip_pipeline = Pipeline([
+            ('clipper', QuantileClipper(lower=clip_quantiles[0], upper=clip_quantiles[1])),
+            ('scaler', StandardScaler())
+        ])
+        transformers.append(('clip', clip_pipeline, clip_cols))
+
+    if len(onehot_cols) > 0:
+        cat_pipeline = Pipeline([('ohe', OneHotEncoder(drop='first', handle_unknown='ignore'))])
+        transformers.append(('cat_ohe', cat_pipeline, onehot_cols))
+
+    if len(count_cols) > 0:
+        # CountEncoder can accept multiple columns; don't pass cols inside if ColumnTransformer slices by names
+        count_pipeline = Pipeline([('count_enc', CountEncoder()), ('scaler', StandardScaler())])
+        transformers.append(('count', count_pipeline, count_cols))
+
+    if len(target_cols) > 0:
+        te_pipeline = Pipeline([('te', TargetEncoder()), ('scaler', StandardScaler())])
+        transformers.append(('target', te_pipeline, target_cols))
+
+    if len(transformers) == 0:
+        raise ValueError("Нечего трансформировать — проверьте конфигурацию колонок.")
+
+    preprocessor = ColumnTransformer(transformers, remainder='drop')
+
+    # 4. Split 
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=seed)
+
+    # 5. Models
+    if models is None:
+        models = {
+            'XGBoost': XGBRegressor(random_state=seed)
+        }
+
+    if scoring is None:
+        scoring = [
+            'r2',
+            'neg_mean_squared_error',
+            'neg_mean_absolute_error',
+            'neg_mean_absolute_percentage_error',
+            'neg_root_mean_squared_error'
+        ]
+
+    cv = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+
+    # 6. Cross-validation
+    cross_val_res = {}
+    for name, model in models.items():
+        pipeline = Pipeline([('preprocessor', preprocessor), ('model', model)])
+        cv_results = cross_validate(
+            pipeline, X_train, y_train, cv=cv, scoring=scoring, n_jobs=n_jobs, error_score='raise'
+        )
+        cross_val = {}
+        for metric in scoring:
+            arr = cv_results[f'test_{metric}']
+            # For negative errors: take absolute for human-readable positive numbers
+            mean_score = np.abs(arr.mean())
+            std_score = np.abs(arr.std())
+            cross_val[metric] = round(mean_score, 4)
+        cross_val_res[name] = cross_val
+
+    result_cross_val = pd.DataFrame(cross_val_res).T
+    # rename negative metric columns to friendly names if present
+    rename_map = {
+        'neg_mean_squared_error': 'mse',
+        'neg_mean_absolute_error': 'mae',
+        'neg_mean_absolute_percentage_error': 'mape',
+        'neg_root_mean_squared_error': 'rmse'
+    }
+    result_cross_val.rename(columns={k: v for k, v in rename_map.items() if k in result_cross_val.columns}, inplace=True)
+
+    # 7. Fit on train and evaluate on test
+    list_of_models = []
+    results = {}
+    for name, model in models.items():
+        pipeline = Pipeline([('preprocessor', preprocessor), ('model', model)])
+        pipeline.fit(X_train, y_train)
+        list_of_models.append(pipeline)
+
+        y_pred = pipeline.predict(X_test)
+        r2 = r2_score(y_test, y_pred)
+        mse_score = mse(y_test, y_pred)
+        mae_score = mae(y_test, y_pred)
+        # Some sklearn versions may not have mean_absolute_percentage_error; we've imported it above
+        try:
+            mape_score = mape(y_test, y_pred)
+        except Exception:
+            # fallback
+            mape_score = np.mean(np.abs((y_test - y_pred) / np.where(y_test == 0, np.nan, y_test)))
+        rmse_score = np.sqrt(mse_score)
+        results[name] = [r2, mse_score, mae_score, mape_score, rmse_score]
+
+    result_test = pd.DataFrame(results, index=['r2', 'mse', 'mae', 'mape', 'rmse']).T
+
+    #outputs = (result_cross_val, result_test, list_of_models)
+    #if return_preprocessor:
+    #    outputs = outputs + (preprocessor,)
+    #if return_splits:
+    #    outputs = outputs + (X_train, X_test, y_train, y_test)
+
+    return result_cross_val, result_test, list_of_models
+
+
 def bin_pipe(df):
     # ====== 1. Разделение на X и y ======
     X = df.drop('price', axis=1)
